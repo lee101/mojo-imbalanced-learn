@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ctypes
 import os
+from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 
@@ -16,9 +17,32 @@ I = ctypes.c_int64
 STATUS = ctypes.c_int32
 _SIGNATURES = {
     "mil_smote_neighbors": ([I, I, I, I, I, I], STATUS),
+    "mil_smote_neighbors_range": ([I, I, I, I, I, I, I, I], STATUS),
     "mil_smote_generate": ([I, I, I, I, I, I, I, I, I], STATUS),
     "mil_gather_f64": ([I, I, I, I, I, I], STATUS),
 }
+
+# A brute-force k-nearest-neighbour sweep is n*n*d fused multiply-adds. Measured
+# on this box the fan-out only wins above roughly eight million of them, and it
+# reaches 2.8x at eight workers, so smaller sweeps stay on one core.
+NEIGHBOR_PARALLEL_WORK = 1 << 23
+NEIGHBOR_MAX_WORKERS = 8
+
+
+def _worker_count(items: int) -> int:
+    try:
+        available = len(os.sched_getaffinity(0))
+    except AttributeError:
+        available = os.cpu_count() or 1
+    return max(1, min(items, NEIGHBOR_MAX_WORKERS, available))
+
+
+def _spans(total: int, parts: int) -> list[tuple[int, int]]:
+    """Split ``total`` rows into ``parts`` contiguous, near-equal spans."""
+    step = -(-total // parts)
+    return [
+        (lo, min(lo + step, total)) for lo in range(0, total, step) if lo < total
+    ]
 
 _library: ctypes.CDLL | None = None
 
@@ -67,10 +91,24 @@ def smote_neighbors(X: np.ndarray, k: int) -> np.ndarray:
         raise ValueError("invalid matrix shape or neighbor count")
     indices = np.empty((n, k + 1), dtype=np.int64)
     distances = np.empty((n, k + 1), dtype=np.float64)
-    status = lib().mil_smote_neighbors(
-        addr(X), addr(indices), addr(distances), n, d, k
-    )
-    _check_status("mil_smote_neighbors", status)
+    if n * n * d < NEIGHBOR_PARALLEL_WORK:
+        status = lib().mil_smote_neighbors(
+            addr(X), addr(indices), addr(distances), n, d, k
+        )
+        _check_status("mil_smote_neighbors", status)
+        return indices
+
+    workers = _worker_count(n)
+    function = lib().mil_smote_neighbors_range
+    arguments = (addr(X), addr(indices), addr(distances), n, d, k + 1)
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        statuses = list(
+            pool.map(
+                lambda span: function(*arguments, span[0], span[1]),
+                _spans(n, workers),
+            )
+        )
+    _check_status("mil_smote_neighbors_range", max(statuses))
     return indices
 
 

@@ -111,12 +111,16 @@ No GPU path is provided.
 
 `src/capi.mojo` is one compilation unit containing three kernels: sorted
 within-class k-nearest-neighbor search, SMOTE interpolation, and indexed row
-gathering. Neighbor search and gathering use SIMD with scalar remainder loops
-and switch from serial execution to eight CPU workers only above size
-thresholds. `build/build.sh` emits one shared library. The Python classes
-validate the estimator contract, resolve sampling strategies, reproduce
-upstream random-number sequencing, allocate outputs, and call the kernels once
-per operation.
+gathering. Neighbor search and gathering use SIMD with scalar remainder loops.
+Neighbor search is a compute-bound `n*n*d` sweep, so the Python shim fans it out
+across a `ThreadPoolExecutor` above 8.4M fused multiply-adds and reaches about
+2.8x at eight workers; below that it runs on one core, where threading only adds
+synchronisation. Indexed row gathering moves `d` doubles per row and performs no
+arithmetic worth splitting, so it always runs serially.
+`build/build.sh` emits one shared library. The Python classes validate the
+estimator contract, resolve sampling strategies, reproduce upstream
+random-number sequencing, allocate outputs, and call the kernels once per
+operation.
 
 Dense kernel inputs are C-contiguous, row-major float64 arrays. Python owns all
 input, output, and scratch memory. Buffers cross the C ABI as integer addresses;

@@ -1,14 +1,10 @@
 """Dense resampling kernels exposed through a small C ABI."""
 
-from std.algorithm import parallelize
 from std.sys.info import simd_width_of
 
 comptime Ptr = UnsafePointer[Float64, AnyOrigin[mut=True]]
 comptime IPtr = UnsafePointer[Int64, AnyOrigin[mut=True]]
 comptime W = simd_width_of[DType.float64]()
-comptime GATHER_CHUNK_ROWS = 4096
-comptime GATHER_PARALLEL_ELEMENTS = 1 << 18
-comptime NEIGHBOR_PARALLEL_WORK = 1 << 20
 comptime MAX_INDEX = 9223372036854775807
 
 
@@ -79,21 +75,40 @@ def mil_smote_neighbors(
         return 2
     if n > MAX_INDEX // d or n > MAX_INDEX // (k + 1):
         return 2
-    var x = p(x_addr)
-    var indices = ip(index_addr)
-    var distances = p(distance_addr)
-    var width = k + 1
-    if n <= NEIGHBOR_PARALLEL_WORK // n // d:
-        smote_neighbor_rows(x, indices, distances, n, d, width, 0, n)
-        return 0
+    smote_neighbor_rows(
+        p(x_addr), ip(index_addr), p(distance_addr), n, d, k + 1, 0, n
+    )
+    return 0
 
-    @parameter
-    def find_neighbors(query: Int):
-        smote_neighbor_rows(
-            x, indices, distances, n, d, width, query, query + 1
-        )
 
-    parallelize[find_neighbors](n, 8)
+@export("mil_smote_neighbors_range")
+def mil_smote_neighbors_range(
+    x_addr: Int,
+    index_addr: Int,
+    distance_addr: Int,
+    n: Int,
+    d: Int,
+    width: Int,
+    begin: Int,
+    end: Int,
+) abi("C") -> Int32:
+    """Fill rows [begin, end) of the neighbor table; the shim fans this out."""
+    if x_addr == 0 or index_addr == 0 or distance_addr == 0:
+        return 1
+    if (
+        n <= 0
+        or d <= 0
+        or width <= 0
+        or width > n
+        or n > MAX_INDEX // d
+        or n > MAX_INDEX // width
+    ):
+        return 2
+    if begin < 0 or end > n or begin >= end:
+        return 2
+    smote_neighbor_rows(
+        p(x_addr), ip(index_addr), p(distance_addr), n, d, width, begin, end
+    )
     return 0
 
 
@@ -151,22 +166,12 @@ def mil_smote_generate(
     return 0
 
 
-def gather_rows(
-    x: Ptr,
-    indices: IPtr,
-    dst: Ptr,
-    d: Int,
-    begin: Int,
-    end: Int,
-):
-    for target in range(begin, end):
+def gather_rows(x: Ptr, indices: IPtr, dst: Ptr, d: Int, rows: Int):
+    for target in range(rows):
         var source = Int(indices[target])
         var j = 0
         while j + W <= d:
-            dst.store(
-                target * d + j,
-                x.load[width=W](source * d + j),
-            )
+            dst.store(target * d + j, x.load[width=W](source * d + j))
             j += W
         while j < d:
             dst[target * d + j] = x[source * d + j]
@@ -195,17 +200,7 @@ def mil_gather_f64(
         var source = Int(indices[target])
         if source < 0 or source >= source_rows:
             return 3
-    if rows * d < GATHER_PARALLEL_ELEMENTS:
-        gather_rows(x, indices, dst, d, 0, rows)
-        return 0
-
-    var chunks = (rows + GATHER_CHUNK_ROWS - 1) // GATHER_CHUNK_ROWS
-
-    @parameter
-    def gather_chunk(chunk: Int):
-        var begin = chunk * GATHER_CHUNK_ROWS
-        var end = min(begin + GATHER_CHUNK_ROWS, rows)
-        gather_rows(x, indices, dst, d, begin, end)
-
-    parallelize[gather_chunk](chunks, 8)
+    # A row gather moves d doubles per row and does no arithmetic worth
+    # splitting, so it stays on one core regardless of size.
+    gather_rows(x, indices, dst, d, rows)
     return 0
